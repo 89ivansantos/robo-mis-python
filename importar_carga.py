@@ -14,18 +14,20 @@ import pyodbc
 # Pasta onde os arquivos Excel chegam.
 PASTA_ENTRADA = Path(r"C:\arquivos\robo_mis")
 
-# Pastas de destino conforme o resultado do processamento.
+# Pasta para arquivos processados com sucesso.
 PASTA_PROCESSADOS = PASTA_ENTRADA / "processados"
+
+# Pasta para arquivos que apresentaram erro.
 PASTA_ERRO = PASTA_ENTRADA / "error"
 
-# A conexão é obtida por variável de ambiente.
-# Assim, usuário e senha não ficam expostos no GitHub.
+# String de conexão obtida por variável de ambiente.
+# Não deixar usuário, senha ou servidor diretamente no GitHub.
 CONNECTION_STRING = os.getenv("CONNECTION_STRING")
 
-# Aba esperada no arquivo Excel.
+# Nome da aba esperada no Excel.
 ABA_EXCEL = "Dados"
 
-# Colunas esperadas no arquivo de entrada.
+# Colunas obrigatórias do arquivo de entrada.
 COLUNAS_ESPERADAS = [
     "cliente",
     "produto",
@@ -59,27 +61,32 @@ def validar_nomenclatura(arquivo):
 
         robo_mis_ddmmaaaa.xlsx
 
-    Também verifica se a data informada é uma data válida.
+    Além da estrutura do nome, valida se a data informada
+    realmente existe.
     """
 
     nome = arquivo.name
 
+    # Verifica o prefixo.
     if not nome.startswith("robo_mis_"):
         return False
 
+    # Verifica a extensão.
     if arquivo.suffix.lower() != ".xlsx":
         return False
 
-    # Retira o prefixo "robo_mis_" e a extensão ".xlsx".
+    # Remove prefixo e extensão.
     data = nome[len("robo_mis_"):-5]
 
+    # A data deve possuir exatamente 8 caracteres.
     if len(data) != 8:
         return False
 
+    # A data deve conter somente números.
     if not data.isdigit():
         return False
 
-    # Garante que DDMMYYYY representa uma data real.
+    # Valida se a data realmente existe.
     try:
         datetime.strptime(data, "%d%m%Y")
     except ValueError:
@@ -89,42 +96,31 @@ def validar_nomenclatura(arquivo):
 
 
 # ============================================================
-# 3. VERIFICAR DUPLICIDADE NO BANCO
+# 3. VERIFICAR DUPLICIDADE
 # ============================================================
 
-def verificar_arquivo_banco(arquivo, conexao):
+def arquivo_existe_banco(nome_arquivo, conexao):
     """
-    Verifica se o nome do arquivo já existe no banco.
+    Verifica se o arquivo já foi processado anteriormente.
 
-    Retorna:
-        True  -> arquivo já existe
-        False -> arquivo não existe
+    A consulta é feita na tabela tab_mis_arquivo.
     """
 
-    nome = arquivo.name
+    cursor = conexao.cursor()
 
-    try:
-        cursor = conexao.cursor()
+    sql = """
+        SELECT 1
+        FROM tab_mis_arquivo
+        WHERE nome_arquivo = ?
+    """
 
-        sql = """
-            SELECT 1
-            FROM tab_mis_arquivo
-            WHERE nome_arquivo = ?
-        """
+    cursor.execute(sql, nome_arquivo)
 
-        cursor.execute(sql, nome)
+    resultado = cursor.fetchone()
 
-        resultado = cursor.fetchone()
+    cursor.close()
 
-        return resultado is not None
-
-    except Exception as erro:
-        print(
-            f"Erro ao verificar arquivo no banco: {erro}"
-        )
-
-        # Propaga o erro para que o main() faça o tratamento.
-        raise
+    return resultado is not None
 
 
 # ============================================================
@@ -133,16 +129,15 @@ def verificar_arquivo_banco(arquivo, conexao):
 
 def ler_excel(arquivo):
     """
-    Lê a aba 'Dados' do arquivo Excel e retorna um DataFrame.
-
-    Se o arquivo estiver corrompido ou a aba não existir,
-    a exceção será tratada pelo main().
+    Lê a aba 'Dados' do arquivo Excel.
     """
 
-    return pd.read_excel(
+    df = pd.read_excel(
         arquivo,
         sheet_name=ABA_EXCEL
     )
+
+    return df
 
 
 # ============================================================
@@ -151,119 +146,206 @@ def ler_excel(arquivo):
 
 def validar_layout(df):
     """
-    Verifica se o DataFrame possui as colunas esperadas.
+    Verifica se todas as colunas obrigatórias estão presentes.
 
-    A comparação ignora:
-        - maiúsculas/minúsculas;
-        - espaços no início e no final.
-
-    A ordem das colunas não é considerada.
+    A posição das colunas no Excel não precisa ser a mesma.
     """
 
-    colunas = [
-        str(coluna).lower().strip()
-        for coluna in df.columns
-    ]
+    colunas = list(df.columns)
 
-    return set(colunas) == set(COLUNAS_ESPERADAS)
+    return all(
+        coluna in colunas
+        for coluna in COLUNAS_ESPERADAS
+    )
 
 
 # ============================================================
 # 6. PREPARAR DADOS
 # ============================================================
 
-def preparar_dados(
-    df,
-    data_importacao,
-    nome_arquivo,
-    id_referencia
-):
+def preparar_dados(df, data_importacao, nome_arquivo, id_referencia):
     """
-    Acrescenta ao DataFrame as informações de controle
-    utilizadas no processo de importação.
+    Organiza as colunas do arquivo e adiciona as informações
+    de controle da importação.
+
+    Resultado final:
+        cliente
+        produto
+        valor
+        data
+        data_importacao
+        nome_arquivo
+        id_referencia
     """
 
+    # Mantém somente as colunas esperadas na ordem correta.
+    df = df[COLUNAS_ESPERADAS].copy()
+
+    # Adiciona a data/hora da importação.
     df["data_importacao"] = data_importacao
+
+    # Adiciona o nome do arquivo de origem.
     df["nome_arquivo"] = nome_arquivo
+
+    # Adiciona o identificador do processo.
     df["id_referencia"] = id_referencia
 
     return df
 
 
 # ============================================================
-# 7. INSERIR DADOS NO BANCO
+# 7. INSERIR DADOS NO SQL SERVER
 # ============================================================
 
 def inserir_banco(df, conexao):
     """
-    Insere os registros do DataFrame no SQL Server.
+    Insere os dados na tabela do SQL Server.
 
-    A inserção é realizada em lote com executemany().
-
-    Em caso de sucesso:
-        COMMIT
-
-    Em caso de erro:
-        ROLLBACK
-
-    Retorna a quantidade de registros do DataFrame.
+    A quantidade de registros inseridos é retornada
+    para utilização no log.
     """
 
-    try:
-        cursor = conexao.cursor()
+    if df.empty:
+        raise ValueError(
+            "O arquivo não possui registros para importação."
+        )
 
-        # Converte cada linha do DataFrame em uma tupla.
-        dados = list(
-            df.itertuples(
-                index=False,
-                name=None
+    cursor = conexao.cursor()
+
+    # Permite maior desempenho em inserções em lote.
+    cursor.fast_executemany = True
+
+    sql = """
+        INSERT INTO tab_mis_dados (
+            cliente,
+            produto,
+            valor,
+            data,
+            data_importacao,
+            nome_arquivo,
+            id_referencia
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+    """
+
+    registros = []
+
+    for _, linha in df.iterrows():
+
+        registros.append(
+            (
+                None if pd.isna(linha["cliente"])
+                else linha["cliente"],
+
+                None if pd.isna(linha["produto"])
+                else linha["produto"],
+
+                None if pd.isna(linha["valor"])
+                else linha["valor"],
+
+                None if pd.isna(linha["data"])
+                else linha["data"],
+
+                linha["data_importacao"],
+
+                linha["nome_arquivo"],
+
+                linha["id_referencia"]
             )
         )
 
-        sql = """
-            INSERT INTO tab_mis_dados (
-                cliente,
-                produto,
-                valor,
-                data,
-                data_importacao,
-                nome_arquivo,
-                id_referencia
-            )
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-        """
+    cursor.executemany(sql, registros)
 
-        # Inserção em lote.
-        cursor.executemany(
-            sql,
-            dados
-        )
+    quantidade = len(registros)
 
-        # Confirma a transação somente após a inserção
-        # ser concluída sem exceções.
-        conexao.commit()
+    cursor.close()
 
-        return len(df)
-
-    except Exception:
-        # Se qualquer registro provocar erro,
-        # desfazemos a transação.
-        conexao.rollback()
-
-        # O erro será tratado pelo main().
-        raise
+    return quantidade
 
 
 # ============================================================
-# 8. MOVER ARQUIVO
+# 8. REGISTRAR ARQUIVO PROCESSADO
+# ============================================================
+
+def registrar_arquivo(nome_arquivo, conexao):
+    """
+    Registra o arquivo processado na tabela tab_mis_arquivo.
+
+    Esse registro permite identificar posteriormente se o
+    mesmo arquivo já foi importado.
+    """
+
+    cursor = conexao.cursor()
+
+    sql = """
+        INSERT INTO tab_mis_arquivo (
+            nome_arquivo
+        )
+        VALUES (?)
+    """
+
+    cursor.execute(sql, nome_arquivo)
+
+    cursor.close()
+
+
+# ============================================================
+# 9. REGISTRAR LOG
+# ============================================================
+
+def registrar_log(arquivo, status, quantidade, erro=None):
+    """
+    Registra o resultado do processamento.
+
+    O log é mantido em arquivo local para acompanhamento
+    da execução do robô.
+    """
+
+    pasta_log = PASTA_ENTRADA / "logs"
+
+    pasta_log.mkdir(
+        parents=True,
+        exist_ok=True
+    )
+
+    arquivo_log = (
+        pasta_log /
+        f"log_{datetime.now():%Y%m%d}.txt"
+    )
+
+    data_hora = datetime.now().strftime(
+        "%d/%m/%Y %H:%M:%S"
+    )
+
+    mensagem = (
+        f"{data_hora} | "
+        f"{arquivo.name} | "
+        f"{status} | "
+        f"Registros: {quantidade}"
+    )
+
+    if erro:
+        mensagem += f" | Erro: {erro}"
+
+    with open(
+        arquivo_log,
+        "a",
+        encoding="utf-8"
+    ) as log:
+
+        log.write(
+            mensagem + "\n"
+        )
+
+
+# ============================================================
+# 10. MOVER ARQUIVO
 # ============================================================
 
 def mover_arquivo(arquivo, pasta_destino):
     """
-    Move o arquivo para a pasta de destino.
-
-    Sucesso -> Processados
-    Erro    -> Error
+    Move o arquivo para a pasta correspondente ao resultado
+    do processamento.
     """
 
     pasta_destino.mkdir(
@@ -280,190 +362,280 @@ def mover_arquivo(arquivo, pasta_destino):
 
 
 # ============================================================
-# 9. REGISTRAR LOG
+# 11. PROCESSAR ARQUIVO
 # ============================================================
 
-def registrar_log(arquivo, status, mensagem):
+
+def processar_arquivo(arquivo, conexao):
     """
-    Registra o resultado do processamento.
+    Executa todas as etapas de processamento de um arquivo.
 
-    Neste projeto didático, o log é exibido no console.
-    Essa função pode posteriormente ser adaptada para
-    gravar em uma tabela de log no SQL Server.
-    """
-
-    print(
-        f"Arquivo: {arquivo.name} | "
-        f"Status: {status} | "
-        f"Informação: {mensagem}"
-    )
-
-
-# ============================================================
-# 10. PROCESSO PRINCIPAL
-# ============================================================
-
-def main():
-    """
-    Orquestra todo o processo de importação.
+    O banco é confirmado antes da movimentação física do arquivo.
+    Dessa forma, caso a movimentação apresente erro após o COMMIT,
+    os dados não serão indevidamente considerados como não importados.
     """
 
-    # Localiza os arquivos antes de iniciar o processamento.
-    arquivos = buscar_arquivos(
-        PASTA_ENTRADA
-    )
-
-    # Inicializamos como None para saber se a conexão
-    # chegou a ser criada.
-    conexao = None
+    quantidade_importada = 0
+    transacao_confirmada = False
 
     try:
-        # A conexão é aberta uma única vez e reutilizada
-        # para todos os arquivos.
-        if not CONNECTION_STRING:
+
+        # ----------------------------------------------------
+        # Validação da nomenclatura
+        # ----------------------------------------------------
+
+        if not validar_nomenclatura(arquivo):
+
             raise ValueError(
-                "A variável CONNECTION_STRING não foi configurada."
+                "Nomenclatura do arquivo inválida."
             )
 
-        conexao = pyodbc.connect(
-            CONNECTION_STRING
+
+        # ----------------------------------------------------
+        # Verificação de duplicidade
+        # ----------------------------------------------------
+
+        if arquivo_existe_banco(
+            arquivo.name,
+            conexao
+        ):
+
+            raise ValueError(
+                "Arquivo já processado anteriormente."
+            )
+
+
+        # ----------------------------------------------------
+        # Leitura do Excel
+        # ----------------------------------------------------
+
+        df = ler_excel(arquivo)
+
+
+        # ----------------------------------------------------
+        # Validação do layout
+        # ----------------------------------------------------
+
+        if not validar_layout(df):
+
+            raise ValueError(
+                "Layout do arquivo inválido."
+            )
+
+
+        # ----------------------------------------------------
+        # Validação de arquivo vazio
+        # ----------------------------------------------------
+
+        if df.empty:
+
+            raise ValueError(
+                "Arquivo Excel sem registros."
+            )
+
+
+        # ----------------------------------------------------
+        # Preparação dos dados
+        # ----------------------------------------------------
+
+        data_importacao = datetime.now()
+
+        df = preparar_dados(
+            df,
+            data_importacao,
+            arquivo.name,
+            ID_REFERENCIA
         )
 
-        # Processa cada arquivo individualmente.
-        for arquivo in arquivos:
 
-            try:
-                # ------------------------------------------------
-                # 1. VALIDAR NOMENCLATURA
-                # ------------------------------------------------
+        # ----------------------------------------------------
+        # Inserção dos dados
+        # ----------------------------------------------------
 
-                if not validar_nomenclatura(arquivo):
-                    continue
+        quantidade_importada = inserir_banco(
+            df,
+            conexao
+        )
 
-                # ------------------------------------------------
-                # 2. VERIFICAR DUPLICIDADE
-                # ------------------------------------------------
 
-                if verificar_arquivo_banco(
-                    arquivo,
-                    conexao
-                ):
-                    mover_arquivo(
-                        arquivo,
-                        PASTA_ERRO
-                    )
+        # ----------------------------------------------------
+        # Registro do arquivo processado
+        # ----------------------------------------------------
 
-                    registrar_log(
-                        arquivo,
-                        "ERRO",
-                        "Arquivo já existe no banco"
-                    )
+        registrar_arquivo(
+            arquivo.name,
+            conexao
+        )
 
-                    continue
 
-                # ------------------------------------------------
-                # 3. LER EXCEL
-                # ------------------------------------------------
+        # ----------------------------------------------------
+        # Confirma a transação
+        # ----------------------------------------------------
 
-                df = ler_excel(arquivo)
+        conexao.commit()
 
-                # ------------------------------------------------
-                # 4. VALIDAR LAYOUT
-                # ------------------------------------------------
+        transacao_confirmada = True
 
-                if not validar_layout(df):
-                    mover_arquivo(
-                        arquivo,
-                        PASTA_ERRO
-                    )
 
-                    registrar_log(
-                        arquivo,
-                        "ERRO",
-                        "Layout inválido"
-                    )
+        # ----------------------------------------------------
+        # Movimentação após confirmação do banco
+        # ----------------------------------------------------
 
-                    continue
+        try:
 
-                # ------------------------------------------------
-                # 5. PREPARAR DADOS
-                # ------------------------------------------------
+            mover_arquivo(
+                arquivo,
+                PASTA_PROCESSADOS
+            )
 
-                data_importacao = datetime.now()
+        except Exception as erro_movimentacao:
 
-                df = preparar_dados(
-                    df,
-                    data_importacao,
-                    arquivo.name,
-                    ID_REFERENCIA
-                )
+            # O banco já foi confirmado.
+            # Portanto, NÃO executar rollback aqui.
 
-                # ------------------------------------------------
-                # 6. INSERIR NO BANCO
-                # ------------------------------------------------
+            registrar_log(
+                arquivo,
+                "SUCESSO_BANCO_ERRO_MOVIMENTACAO",
+                quantidade_importada,
+                str(erro_movimentacao)
+            )
 
-                quantidade_importada = inserir_banco(
-                    df,
-                    conexao
-                )
+            return False
 
-                # ------------------------------------------------
-                # 7. MOVER PARA PROCESSADOS
-                # ------------------------------------------------
 
-                mover_arquivo(
-                    arquivo,
-                    PASTA_PROCESSADOS
-                )
+        # ----------------------------------------------------
+        # Registro de sucesso
+        # ----------------------------------------------------
 
-                # ------------------------------------------------
-                # 8. REGISTRAR SUCESSO
-                # ------------------------------------------------
+        registrar_log(
+            arquivo,
+            "SUCESSO",
+            quantidade_importada
+        )
 
-                registrar_log(
-                    arquivo,
-                    "SUCESSO",
-                    f"{quantidade_importada} linhas importadas"
-                )
+        return True
 
-            except Exception as erro:
-                # ------------------------------------------------
-                # ERRO DURANTE O PROCESSAMENTO DO ARQUIVO
-                # ------------------------------------------------
+
+    except Exception as erro:
+
+        # ----------------------------------------------------
+        # Só executa rollback se o COMMIT ainda não ocorreu.
+        # ----------------------------------------------------
+
+        if not transacao_confirmada:
+
+            conexao.rollback()
+
+
+        # ----------------------------------------------------
+        # Movimenta o arquivo para a pasta de erro.
+        # ----------------------------------------------------
+
+        try:
+
+            if arquivo.exists():
 
                 mover_arquivo(
                     arquivo,
                     PASTA_ERRO
                 )
 
-                registrar_log(
-                    arquivo,
-                    "ERRO",
-                    str(erro)
+        except Exception as erro_movimentacao:
+
+            registrar_log(
+                arquivo,
+                "ERRO",
+                quantidade_importada,
+                (
+                    f"{erro} | "
+                    f"Erro ao mover arquivo: "
+                    f"{erro_movimentacao}"
                 )
+            )
 
-                # O erro deste arquivo não interrompe
-                # o processamento dos arquivos seguintes.
-                continue
+            return False
 
-    except Exception as erro:
-        # --------------------------------------------------------
-        # ERRO GERAL DO PROCESSO
-        # --------------------------------------------------------
 
-        print(
-            f"Erro geral do processo: {erro}"
+        # ----------------------------------------------------
+        # Registro do erro.
+        # ----------------------------------------------------
+
+        registrar_log(
+            arquivo,
+            "ERRO",
+            quantidade_importada,
+            str(erro)
         )
 
+        return False
+
+# ============================================================
+# 12. PROCESSO PRINCIPAL
+# ============================================================
+
+def main():
+    """
+    Controla a execução completa do robô.
+
+    A conexão com o SQL Server é aberta uma única vez
+    e utilizada durante todo o processamento.
+    """
+
+    # Localiza os arquivos disponíveis.
+    arquivos = buscar_arquivos(
+        PASTA_ENTRADA
+    )
+
+    conexao = None
+
+    try:
+
+        # ----------------------------------------------------
+        # Validação da conexão
+        # ----------------------------------------------------
+
+        if not CONNECTION_STRING:
+
+            raise ValueError(
+                "A variável de ambiente "
+                "'CONNECTION_STRING' não foi configurada."
+            )
+
+
+        # ----------------------------------------------------
+        # Abre uma única conexão com o banco.
+        # ----------------------------------------------------
+
+        conexao = pyodbc.connect(
+            CONNECTION_STRING
+        )
+
+
+        # ----------------------------------------------------
+        # Processa cada arquivo individualmente.
+        # ----------------------------------------------------
+
+        for arquivo in arquivos:
+
+            processar_arquivo(
+                arquivo,
+                conexao
+            )
+
+
     finally:
-        # A conexão é encerrada uma única vez ao final
-        # do processamento.
+
+        # ----------------------------------------------------
+        # Fecha a conexão ao finalizar o processo.
+        # ----------------------------------------------------
+
         if conexao:
+
             conexao.close()
 
 
 # ============================================================
-# PONTO DE ENTRADA
+# EXECUÇÃO
 # ============================================================
 
 if __name__ == "__main__":
