@@ -1,0 +1,39 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Virtual environment
+.venv/
+venv/
+env/
+ENV/
+
+# Environment variables / secrets
+.env
+.env.*
+!.env.example
+
+# IDE / editors
+.vscode/
+.idea/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Logs
+*.log
+
+# Temporary / generated files
+*.tmp
+*.temp
+~$*
+*.bak
+
+# Excel temporary/lock files
+~$*.xlsx
+~$*.xls
+
+# Local project folders
+processados/
+error/
